@@ -10,7 +10,6 @@ import java.util.*;
 import java.util.stream.Collectors;
 import org.apache.hc.client5.http.classic.methods.HttpGet;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
-import org.apache.hc.core5.http.ParseException;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,14 +21,14 @@ public class JiraFetchTasks {
   private static final String USERNAME = System.getenv("JIRA_EMAIL");
   private static final String API_TOKEN = System.getenv("JIRA_TOKEN");
 
-  public static void main(String[] args) throws IOException, ParseException {
-    var worklogs = fetchWorklogsFromLast24Hours();
-    var authorWorklogs = worklogs.stream().collect(Collectors.groupingBy(Worklog::author));
+  public static void main(String[] args) throws IOException {
+    var worklogs = fetchWorkLogsFromLast24Hours();
+    var authorWorklogs = worklogs.stream().collect(Collectors.groupingBy(WorkLog::author));
     for (var logs : authorWorklogs.entrySet()) {
       var author = logs.getKey();
       var workedOnTaskWithMaxPriority =
-          logs.getValue().stream().min(Comparator.comparingInt(Worklog::priority)).orElseThrow();
-      log.info("Worked on task with highest priority : {}",workedOnTaskWithMaxPriority.summary());
+          logs.getValue().stream().min(Comparator.comparingInt(WorkLog::priority)).orElseThrow();
+      log.info("Worked on task with highest priority : {}", workedOnTaskWithMaxPriority.summary());
       int maxPriority = workedOnTaskWithMaxPriority.priority();
       if (checkForHighPriorityTasks(author, maxPriority)) {
         log.warn("Task with higher priority found for author : {}", author);
@@ -39,12 +38,12 @@ public class JiraFetchTasks {
     }
   }
 
-  public static List<Worklog> fetchWorklogsFromLast24Hours() throws IOException, ParseException {
+  public static List<WorkLog> fetchWorkLogsFromLast24Hours() throws IOException {
     var jql = URLEncoder.encode("worklogDate >= -1d", StandardCharsets.UTF_8);
     return fetchWorkLogs(jql);
   }
 
-  private static List<Worklog> fetchWorkLogs(String jql) throws IOException, ParseException {
+  private static List<WorkLog> fetchWorkLogs(String jql) throws IOException {
     var searchUrl =
         JIRA_URL + "/rest/api/2/search?jql=" + jql + "&fields=worklog,summary,priority,ranks";
     var request = new HttpGet(searchUrl);
@@ -53,47 +52,49 @@ public class JiraFetchTasks {
     var authHeader = "Basic " + new String(encodedAuth);
     request.setHeader("Authorization", authHeader);
 
-    List<Worklog> worklogs = new ArrayList<>();
-    try (var httpClient = HttpClients.createDefault();
-        var response = httpClient.execute(request)) {
+    List<WorkLog> workLogs = new ArrayList<>();
+    try (var httpClient = HttpClients.createDefault()) {
+      return httpClient.execute(
+          request,
+          response -> {
+            var responseBody = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+            var jsonResponse = JsonParser.parseString(responseBody).getAsJsonObject();
+            var issues = jsonResponse.getAsJsonArray("issues");
 
-      var responseBody = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
-      //System.out.println(responseBody);
-      var jsonResponse = JsonParser.parseString(responseBody).getAsJsonObject();
-      var issues = jsonResponse.getAsJsonArray("issues");
+            var formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSZ");
 
-      var formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSZ");
+            for (var i = 0; i < issues.size(); i++) {
+              var issue = issues.get(i).getAsJsonObject();
+              var fields = issue.getAsJsonObject("fields");
+              var worklog = fields.getAsJsonObject("worklog");
+              var worklogsArray = worklog.getAsJsonArray("worklogs");
+              var priorityObj = fields.getAsJsonObject("priority");
 
-      for (var i = 0; i < issues.size(); i++) {
-        var issue = issues.get(i).getAsJsonObject();
-        var fields = issue.getAsJsonObject("fields");
-        var worklog = fields.getAsJsonObject("worklog");
-        var worklogsArray = worklog.getAsJsonArray("worklogs");
-        var priorityObj = fields.getAsJsonObject("priority");
-        var rankObj = fields.getAsJsonObject("rank");
+              for (var j = 0; j < worklogsArray.size(); j++) {
+                var worklogEntry = worklogsArray.get(j).getAsJsonObject();
+                var started = worklogEntry.get("started").getAsString();
+                var startedDate = LocalDateTime.parse(started, formatter);
 
-        for (var j = 0; j < worklogsArray.size(); j++) {
-          var worklogEntry = worklogsArray.get(j).getAsJsonObject();
-          var started = worklogEntry.get("started").getAsString();
-          var startedDate = LocalDateTime.parse(started, formatter);
-
-          if (startedDate.isAfter(LocalDateTime.now().minusDays(1))) {
-            var issueKey = issue.get("key").getAsString();
-            var summary = fields.get("summary").getAsString();
-            var author = worklogEntry.getAsJsonObject("author").get("displayName").getAsString();
-            var timeSpent = worklogEntry.get("timeSpent").getAsString();
-            var priority = priorityObj.get("id").getAsInt(); // Extract numerical priority value
-            worklogs.add(
-                new Worklog(issueKey, summary, author, started, timeSpent, priority, null));
-          }
-        }
-      }
+                if (startedDate.isAfter(LocalDateTime.now().minusDays(1))) {
+                  var issueKey = issue.get("key").getAsString();
+                  var summary = fields.get("summary").getAsString();
+                  var author =
+                      worklogEntry.getAsJsonObject("author").get("displayName").getAsString();
+                  var timeSpent = worklogEntry.get("timeSpent").getAsString();
+                  var priority =
+                      priorityObj.get("id").getAsInt(); // Extract numerical priority value
+                  workLogs.add(
+                      new WorkLog(issueKey, summary, author, started, timeSpent, priority, null));
+                }
+              }
+            }
+            return workLogs;
+          });
     }
-    return worklogs;
   }
 
   public static boolean checkForHighPriorityTasks(String author, int providedPriority)
-      throws IOException, ParseException {
+      throws IOException {
     var jql =
         URLEncoder.encode(
             "assignee=\""
@@ -108,13 +109,15 @@ public class JiraFetchTasks {
     var encodedAuth = Base64.getEncoder().encode(auth.getBytes(StandardCharsets.ISO_8859_1));
     var authHeader = "Basic " + new String(encodedAuth);
     request.setHeader("Authorization", authHeader);
-    try (var httpClient = HttpClients.createDefault();
-        var response = httpClient.execute(request)) {
-      var responseBody = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
-      //System.out.println(responseBody);
-      var jsonResponse = JsonParser.parseString(responseBody).getAsJsonObject();
-      var totalIssues = jsonResponse.get("total").getAsInt();
-      return totalIssues > 0;
+    try (var httpClient = HttpClients.createDefault()) {
+      return httpClient.execute(
+          request,
+          response -> {
+            var responseBody = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+            var jsonResponse = JsonParser.parseString(responseBody).getAsJsonObject();
+            var totalIssues = jsonResponse.get("total").getAsInt();
+            return totalIssues > 0;
+          });
     }
   }
 }

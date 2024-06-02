@@ -1,6 +1,6 @@
 package org.example;
 
-record Worklog(
+public record WorkLog(
     String issueKey,
     String summary,
     String author,
