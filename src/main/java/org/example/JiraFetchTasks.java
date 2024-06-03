@@ -1,5 +1,7 @@
 package org.example;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import java.io.IOException;
 import java.net.URLEncoder;
@@ -7,8 +9,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.stream.Collectors;
 import org.apache.hc.client5.http.classic.methods.HttpGet;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.slf4j.Logger;
@@ -22,19 +24,33 @@ public class JiraFetchTasks {
   private static final String API_TOKEN = System.getenv("JIRA_TOKEN");
 
   public static void main(String[] args) throws IOException {
-    var worklogs = fetchWorkLogsFromLast24Hours();
-    var authorWorklogs = worklogs.stream().collect(Collectors.groupingBy(WorkLog::author));
-    for (var logs : authorWorklogs.entrySet()) {
+    var workLogs = fetchWorkLogsFromLast24Hours();
+    log.info("WorkLogs :");
+    for (var workLog : workLogs) {
+      log.info("{}", workLog.summary());
+    }
+    Map<String, List<WorkLog>> authorWorkLogs = new HashMap<>();
+    Map<String, List<WorkLog>> issuesWorkLogs = new HashMap<>();
+    for (var worklog : workLogs) {
+      authorWorkLogs.computeIfAbsent(worklog.author(), k -> new ArrayList<>()).add(worklog);
+      issuesWorkLogs.computeIfAbsent(worklog.issueKey(), k -> new ArrayList<>()).add(worklog);
+    }
+    for (var logs : authorWorkLogs.entrySet()) {
       var author = logs.getKey();
-      var workedOnTaskWithMaxPriority =
+      var workedOnTaskWithMinPriority =
           logs.getValue().stream().min(Comparator.comparingInt(WorkLog::priority)).orElseThrow();
-      log.info("Worked on task with highest priority : {}", workedOnTaskWithMaxPriority.summary());
-      int maxPriority = workedOnTaskWithMaxPriority.priority();
-      if (checkForHighPriorityTasks(author, maxPriority)) {
-        log.warn("Task with higher priority found for author : {}", author);
-      } else {
-        log.info("No task with higher priority");
+      log.info("Lowest priority issue worked on task : {}", workedOnTaskWithMinPriority.summary());
+      var issues = fetchIssuesByPriorityAndRank(author);
+      for (var issue : issues) {
+        if (!issuesWorkLogs.containsKey(issue.issueKey())) {
+          log.info("Found a issue with lower priority : {} {}", author, issue.summary());
+          return;
+        }
+        if (issue.issueKey().equals(workedOnTaskWithMinPriority.issueKey())) {
+          break;
+        }
       }
+      log.info("No lower priority issue found");
     }
   }
 
@@ -93,30 +109,40 @@ public class JiraFetchTasks {
     }
   }
 
-  public static boolean checkForHighPriorityTasks(String author, int providedPriority)
-      throws IOException {
-    var jql =
+  public static List<Issue> fetchIssuesByPriorityAndRank(String author) throws IOException {
+    String jql =
         URLEncoder.encode(
-            "assignee=\""
-                + author
-                + "\" AND priority > "
-                + providedPriority
-                + " AND status='To Do'",
-            StandardCharsets.UTF_8);
-    var searchUrl = JIRA_URL + "/rest/api/2/search?jql=" + jql;
-    var request = new HttpGet(searchUrl);
-    var auth = USERNAME + ":" + API_TOKEN;
-    var encodedAuth = Base64.getEncoder().encode(auth.getBytes(StandardCharsets.ISO_8859_1));
-    var authHeader = "Basic " + new String(encodedAuth);
+            "assignee=\"" + author + "\" ORDER BY priority DESC, rank ASC", StandardCharsets.UTF_8);
+    String searchUrl = JIRA_URL + "/rest/api/2/search?jql=" + jql + "&fields=summary,priority";
+
+    HttpGet request = new HttpGet(searchUrl);
+    String auth = USERNAME + ":" + API_TOKEN;
+    byte[] encodedAuth = Base64.getEncoder().encode(auth.getBytes(StandardCharsets.ISO_8859_1));
+    String authHeader = "Basic " + new String(encodedAuth);
     request.setHeader("Authorization", authHeader);
-    try (var httpClient = HttpClients.createDefault()) {
+
+    try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
       return httpClient.execute(
           request,
           response -> {
-            var responseBody = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
-            var jsonResponse = JsonParser.parseString(responseBody).getAsJsonObject();
-            var totalIssues = jsonResponse.get("total").getAsInt();
-            return totalIssues > 0;
+            String responseBody =
+                EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+            JsonObject jsonResponse = JsonParser.parseString(responseBody).getAsJsonObject();
+            JsonArray issuesJsonArray = jsonResponse.getAsJsonArray("issues");
+
+            List<Issue> issues = new ArrayList<>();
+
+            for (int i = 0; i < issuesJsonArray.size(); i++) {
+              JsonObject issueJsonObject = issuesJsonArray.get(i).getAsJsonObject();
+              String issueKey = issueJsonObject.get("key").getAsString();
+              JsonObject fields = issueJsonObject.getAsJsonObject("fields");
+              String summary = fields.get("summary").getAsString();
+              int priority = fields.getAsJsonObject("priority").get("id").getAsInt();
+
+              Issue issue = new Issue(issueKey, summary, priority);
+              issues.add(issue);
+            }
+            return issues;
           });
     }
   }
